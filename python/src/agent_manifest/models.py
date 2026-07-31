@@ -96,6 +96,12 @@ class PoisoningResult(str, Enum):
     not_scanned = "not-scanned"
 
 
+class AssuranceResult(str, Enum):
+    passed = "pass"
+    flagged = "flagged"
+    not_assessed = "not-assessed"
+
+
 class ApprovalMethod(str, Enum):
     hardware_key = "hardware-key"
     software_key = "software-key"
@@ -183,6 +189,15 @@ class PoisoningScan(SpecModel):
     scanner_version: Optional[str] = None
     scanned_at: Optional[datetime] = None
     result: PoisoningResult
+
+
+class AssuranceTest(SpecModel):
+    # harness, tested_at and baseline are REQUIRED for Level 2+ (spec 3.2.1);
+    # manifests below Level 2 with result=not-assessed may omit them.
+    harness: Optional[str] = None
+    tested_at: Optional[datetime] = None
+    baseline: Optional[str] = None
+    result: AssuranceResult
 
 
 class SlsaProvenance(SpecModel):
@@ -370,6 +385,7 @@ class SystemPromptBinding(SpecModel):
     classification: DataClassification
     language: Optional[str] = None
     safety_level: Optional[str] = None
+    assurance_test: Optional[AssuranceTest] = None
     bound_at: datetime
 
 

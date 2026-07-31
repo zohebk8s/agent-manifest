@@ -529,6 +529,50 @@ def verify_manifest(
         context.system_prompt_hash,
     )
 
+    # --- Configuration assurance rules (spec §3.2.1.1)
+    # Integrity says the bound prompt is the approved one. Assurance says the
+    # approved one was tested. A hash match cannot answer the second question.
+    assurance = sp.get("assurance_test") or {}
+    assurance_result = assurance.get("result")
+    if assurance_result == "flagged":
+        mismatches.append(MismatchDetail(
+            field="system_prompt.assurance_test",
+            expected_hash="<result: pass or not-assessed>",
+            actual_hash="<result: flagged>",
+        ))
+    elif assurance_result == "pass":
+        # Level 2+ requires the provenance of the result, not just the verdict.
+        missing = [k for k in ("harness", "tested_at", "baseline") if not assurance.get(k)]
+        if missing and context.conformance_level >= 2:
+            mismatches.append(MismatchDetail(
+                field="system_prompt.assurance_test",
+                expected_hash="<harness, tested_at, baseline present>",
+                actual_hash=f"<missing: {', '.join(missing)}>",
+            ))
+    elif assurance_result == "not-assessed":
+        # Declared untested. Below Level 2 this is permitted but surfaced.
+        if context.conformance_level >= 2:
+            mismatches.append(MismatchDetail(
+                field="system_prompt.assurance_test",
+                expected_hash="<result: pass>",
+                actual_hash="<result: not-assessed>",
+            ))
+        else:
+            result.warnings.append(
+                "system_prompt.assurance_test.result is 'not-assessed'; "
+                "assess before Level 2 conformance"
+            )
+    elif sp:
+        # Field absent entirely. Pre-change manifests land here and MUST verify
+        # unchanged below Level 2, so no warning is emitted. Level 2 means every
+        # artifact is fully bound, and an unassessed prompt is not fully bound.
+        if context.conformance_level >= 2:
+            mismatches.append(MismatchDetail(
+                field="system_prompt.assurance_test",
+                expected_hash="<result: pass>",
+                actual_hash="<absent>",
+            ))
+
     pb = artifacts.get("policy_bundle") or {}
     fields.policy_bundle = _check(
         "policy_bundle",
