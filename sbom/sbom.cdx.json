@@ -54,7 +54,7 @@
       "version": "6.0.3"
     },
     {
-      "bom-ref": "agent-manifest==0.11.0",
+      "bom-ref": "agent-manifest==0.11.1",
       "description": "Agent Manifest SDK \u2014 cryptographically anchor all 10 artifacts defining an AI agent at deployment",
       "externalReferences": [
         {
@@ -104,7 +104,7 @@
       ],
       "name": "agent-manifest",
       "type": "library",
-      "version": "0.11.0"
+      "version": "0.11.1"
     },
     {
       "bom-ref": "annotated-doc==0.0.5",
@@ -2194,7 +2194,7 @@
         "pydantic==2.13.4",
         "uvicorn==0.52.4"
       ],
-      "ref": "agent-manifest==0.11.0"
+      "ref": "agent-manifest==0.11.1"
     },
     {
       "ref": "annotated-doc==0.0.5"
@@ -2517,7 +2517,7 @@
     }
   ],
   "metadata": {
-    "timestamp": "2026-08-23T09:12:09.527996+00:00",
+    "timestamp": "2026-08-23T13:30:33.437934+00:00",
     "tools": {
       "components": [
         {
@@ -2621,7 +2621,7 @@
       ]
     }
   },
-  "serialNumber": "urn:uuid:39551ccd-6d92-4827-af31-fd53ad193426",
+  "serialNumber": "urn:uuid:eb2a5866-1fca-4d06-9bb6-13d2762f5927",
   "version": 1,
   "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
   "bomFormat": "CycloneDX",
