@@ -93,7 +93,7 @@ def test_the_nonce_is_not_an_input_to_the_context_hash():
         ("enforce_hitl", True),
         ("enforce_attestation", True),
         ("min_slsa_level", 3),
-        ("strict_artifact_verification", True),
+        ("strict_artifact_verification", False),
         ("require_delegation", True),
         ("conformance_level", 2),
     ],

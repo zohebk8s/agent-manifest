@@ -1296,6 +1296,7 @@ Content-Type: application/json
     "verifier_id": "<SPIFFE URI of verifying party>  -- OPTIONAL",
     "required_fields": ["system_prompt", "policy_bundle", "tool_manifest"],
     "enforce_hitl": "<boolean>  -- OPTIONAL, default false",
+    "approver_public_keys": "<object mapping approver_id to trusted base64url Ed25519 public key>  -- REQUIRED when a HITL approval is evaluated",
     "enforce_attestation": "<boolean>  -- OPTIONAL, default false",
     "min_slsa_level": "1 | 2 | 3 | 4  -- OPTIONAL"
   }
@@ -1356,7 +1357,7 @@ A service that receives no `challenge_nonce` returns a result without one, and a
     "decision_trace": "MATCH | EXTENDED | MISMATCH | NOT_BOUND  -- REQUIRED",
     "supply_chain": "MATCH | MISMATCH | NOT_BOUND  -- REQUIRED",
     "delegation_chain": "VALID | INVALID | NOT_PRESENT | UNVERIFIABLE  -- REQUIRED",
-    "hitl_record": "APPROVED | EXPIRED | NOT_REQUIRED | MISSING | APPROVAL_INSUFFICIENT  -- REQUIRED"
+    "hitl_record": "APPROVED | EXPIRED | NOT_REQUIRED | MISSING | APPROVAL_INSUFFICIENT | INVALID | UNVERIFIABLE  -- REQUIRED"
   },
   "configuration_assurance": "PASSED | FLAGGED | NOT_ASSESSED  -- REQUIRED",
   "mismatch_details": [
@@ -1392,6 +1393,8 @@ A service that receives no `challenge_nonce` returns a result without one, and a
 
 `hitl_record` returns `APPROVAL_INSUFFICIENT` when an approval exists but does not meet the `approval_method` requirement for the declared `risk_tier` (e.g., `software-key` approval on a `high` risk tier operation at Level 2).
 
+`hitl_record` returns `INVALID` when an approval's own signature is malformed or does not verify over the current `manifest_id`, `approver_id`, `approved_at`, and exact `approved_scope`. It returns `UNVERIFIABLE` when the verifier has no trusted public key for the approval's `approver_id`. Neither state permits an overall `VALID` result. A manifest or COSE signature does not authenticate approval entries, which attach after issuance and MUST be verified independently.
+
 `challenge_nonce` and `verification_context_hash` bind a result to the request that produced it; see section 5.1.2 for how a relying party checks them and why a `verified_at` timestamp is not a substitute.
 
 The `correlation` object is what a consumer joins this result to runtime evidence with, so the two identities and the exact manifest they came from travel together rather than being reassembled by the consumer. It is always present when the input contains the REQUIRED `agent_id`; a verifier reporting malformed input that omits `agent_id` cannot construct it. `agent_instance_uid` is `null` on a manifest that governs more than one run; see section 6.4.2 for what a producer does in that case.
@@ -1422,6 +1425,7 @@ Access control for confidential payloads: Tool call payload fields in TRACE enve
 A `VALID` result means all of the following are true:
 
 - The manifest signature is valid under RFC 8785 canonicalization and the manifest is present in the transparency log. Before checking the issuer signature, the verifier MUST apply the `hitl_record.approvals` normalization rule from section 3.6 (replace `hitl_record.approvals` with `[]` in the signing pre-image); approvals are verified separately against their own `approval_signature`s
+- Receipt presence alone MUST NOT satisfy the transparency-log condition. A verifier MUST authenticate the receipt or inclusion evidence against its configured Transparency Service trust policy. In particular, a receipt carried in a COSE unprotected header is untrusted input until that independent appraisal succeeds.
 - The TEE attestation report confirms the manifest hash is bound to the hardware measurement
 - All fields specified in `required_fields` match their running artifacts. For `decision_trace`, `EXTENDED` satisfies this condition and `MISMATCH` does not; see Section 3.2.7.1
 - The manifest has not expired

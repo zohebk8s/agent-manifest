@@ -88,6 +88,8 @@ class HitlResult(str, Enum):
     NOT_REQUIRED = "NOT_REQUIRED"
     MISSING = "MISSING"
     APPROVAL_INSUFFICIENT = "APPROVAL_INSUFFICIENT"
+    INVALID = "INVALID"
+    UNVERIFIABLE = "UNVERIFIABLE"
 
 
 class MismatchDetail(BaseModel):
@@ -145,6 +147,10 @@ class VerificationResult(BaseModel):
     verification_context_hash: Optional[str] = None
     result: OverallResult
     signature_verified: bool = False
+    # True only when a receipt/entry was independently appraised against the
+    # relying party's transparency-service trust policy. Presence alone is not
+    # verification because COSE unprotected headers are attacker-malleable.
+    transparency_verified: bool = False
     attestation_verified: bool = False
     fields_verified: FieldsVerified = Field(default_factory=FieldsVerified)
     # Spec 5.2. NOT_ASSESSED is the default because absence of an assessment is
@@ -188,6 +194,11 @@ class VerifyRequest(BaseModel):
     ``trusted_key_issuers`` maps each trusted key_id to the issuer SPIFFE URIs
     authorized to sign manifests with that key. When supplied, key-to-issuer
     authorization is fail-closed.
+
+    ``approver_public_keys`` maps the human-attributable ``approver_id`` on a
+    HITL approval to its trusted Ed25519 public key. HITL verification is
+    fail-closed: an approval without a trusted key is ``UNVERIFIABLE`` and an
+    invalid signature is ``INVALID``; neither can produce ``VALID``.
     """
 
     manifest_id: str
@@ -199,6 +210,13 @@ class VerifyRequest(BaseModel):
     trusted_key_issuers: dict[str, list[str]] = Field(default_factory=dict)
     # principal_id -> base64url-encoded public key bytes (for delegation chain)
     delegation_public_keys: dict[str, str] = Field(default_factory=dict)
+    # approver_id -> base64url-encoded Ed25519 public key bytes (for HITL)
+    approver_public_keys: dict[str, str] = Field(default_factory=dict)
+    # Digests/IDs produced by an independently trusted transparency verifier.
+    verified_transparency_entry_ids: set[str] = Field(default_factory=set)
+    verified_transparency_receipt_hashes: set[str] = Field(default_factory=set)
+    transparency_evidence_manifest_id: Optional[str] = None
+    require_transparency: bool = False
     # When True, a manifest without a delegation_chain is a verification failure
     require_delegation: bool = False
 
@@ -265,8 +283,23 @@ class VerificationContext(BaseModel):
     trusted_key_issuers: dict[str, list[str]] = Field(default_factory=dict)
     # principal_id -> base64url-encoded public key bytes (for delegation chain)
     delegation_public_keys: dict[str, str] = Field(default_factory=dict)
+    # approver_id -> base64url-encoded Ed25519 public key bytes (for HITL)
+    approver_public_keys: dict[str, str] = Field(default_factory=dict)
+    # Legacy Rekor entry UUIDs and sha256 hex digests of raw COSE receipt bytes
+    # that the relying party has independently verified against a trusted log.
+    # These are evidence inputs, not presence assertions made by the envelope.
+    verified_transparency_entry_ids: set[str] = Field(default_factory=set)
+    verified_transparency_receipt_hashes: set[str] = Field(default_factory=set)
+    # The manifest to which the independent appraisal bound those IDs/digests.
+    # This prevents a verified receipt allow-list from becoming replayable.
+    transparency_evidence_manifest_id: Optional[str] = None
+    # Level 1+ implies this requirement even when the flag is false.
+    require_transparency: bool = False
     # When True, bound artifacts without runtime hashes cause INCOMPLETE result
-    strict_artifact_verification: bool = False
+    # Safe by default: an authentic manifest is not proof that the running
+    # artifacts match it. Callers performing an intentional signature-only
+    # appraisal must opt out explicitly.
+    strict_artifact_verification: bool = True
     # When True, manifest must have a delegation chain
     require_delegation: bool = False
     # Conformance level for enforcing spec §3.2.5.1 poisoning_scan rules.
@@ -502,6 +535,7 @@ _CONTEXT_HASH_FIELDS: tuple[str, ...] = (
     "min_slsa_level",
     "purpose",
     "require_delegation",
+    "require_transparency",
     "strict_artifact_verification",
     "verifier_id",
 )
@@ -580,6 +614,8 @@ def verify_manifest(
       result is ``UNVERIFIABLE`` (spec 3.4.1 / 5.2).
     - ``enforce_hitl=True`` with no ``hitl_record`` in the manifest is a
       failure (``HitlResult.MISSING`` and a non-VALID overall result).
+    - An approval is never ``APPROVED`` unless its own signature verifies with
+      a trusted approver key and binds the current manifest ID and scope.
 
     The ``_envelope`` parameter is internal: it carries an already-appraised
     COSE envelope into the shared pipeline and is not part of the public API.
@@ -603,6 +639,8 @@ def verify_manifest(
     result.challenge_nonce = context.challenge_nonce
     mismatches: list[MismatchDetail] = []
     fields = result.fields_verified
+    transparency_present = False
+    transparency_unverifiable = False
 
     # --- Schema validation (fail-closed). verify_manifest accepts a raw dict,
     # so it must run the manifest through the Pydantic guards before trusting
@@ -1014,10 +1052,19 @@ def verify_manifest(
                 ))
             fields.hitl_record = HitlResult.MISSING
         else:
-            # Check if any approval has expired (HITL-001: parse failure must set all_ok=False)
+            # Approval entries attach outside the manifest/COSE signature and
+            # MUST be authenticated independently (spec 3.5, 3.6, and 5.3).
+            # Presence, lifetime, and method checks alone do not prove that a
+            # human approved this manifest: the signature pre-image binds the
+            # manifest ID, approver, timestamp, and exact scope.
+            from ._delegation import verify_hitl_approval
+            from ._signing import _b64url_decode
+
             now = datetime.now(timezone.utc)
             all_ok = True
             approval_insufficient = False
+            approval_invalid = False
+            approval_unverifiable = False
             for approval in approvals:
                 approved_at = approval.get("approved_at", "")
                 duration = approval.get("approved_scope", {}).get("approval_duration_seconds", 0)
@@ -1040,7 +1087,36 @@ def verify_manifest(
                     ):
                         approval_insufficient = True
                         break
-            if approval_insufficient:
+
+                approver_id = approval.get("approver_id")
+                public_key_b64 = context.approver_public_keys.get(approver_id)
+                if public_key_b64 is None:
+                    approval_unverifiable = True
+                    break
+                try:
+                    verify_hitl_approval(
+                        approval,
+                        manifest_id,
+                        _b64url_decode(public_key_b64),
+                    )
+                except (InvalidSignature, KeyError, TypeError, ValueError):
+                    approval_invalid = True
+                    break
+
+            if approval_unverifiable:
+                fields.hitl_record = HitlResult.UNVERIFIABLE
+                result.warnings.append(
+                    "HITL approval could not be authenticated: no trusted "
+                    "approver key is available for its approver_id"
+                )
+            elif approval_invalid:
+                mismatches.append(MismatchDetail(
+                    field="hitl_record.approval_signature",
+                    expected_hash="<valid approval signature bound to this manifest>",
+                    actual_hash="<invalid or malformed approval signature>",
+                ))
+                fields.hitl_record = HitlResult.INVALID
+            elif approval_insufficient:
                 mismatches.append(MismatchDetail(
                     field="hitl_record",
                     expected_hash="<approval method sufficient for declared risk tier>",
@@ -1109,6 +1185,43 @@ def verify_manifest(
                     actual_hash=reported_hash,
                 ))
 
+    # --- Transparency receipt. The envelope field/header is untrusted input;
+    # only an entry ID or receipt digest supplied by an independent log
+    # appraisal can make this true. Level 1+ is production conformance and
+    # therefore requires transparency under spec sections 3.6 and 5.3.
+    require_transparency = context.require_transparency or context.conformance_level >= 1
+    transparency_evidence_bound = context.transparency_evidence_manifest_id == manifest_id
+    if _envelope is not None:
+        for receipt in _envelope.receipts:
+            if not isinstance(receipt, bytes):
+                continue
+            transparency_present = True
+            digest = hashlib.sha256(receipt).hexdigest()
+            if (
+                transparency_evidence_bound
+                and digest in context.verified_transparency_receipt_hashes
+            ):
+                result.transparency_verified = True
+    else:
+        entry = manifest.get("transparency_log_entry")
+        if isinstance(entry, dict):
+            entry_id = entry.get("entry_uuid")
+            transparency_present = isinstance(entry_id, str) and bool(entry_id)
+            if (
+                transparency_evidence_bound
+                and entry_id in context.verified_transparency_entry_ids
+            ):
+                result.transparency_verified = True
+
+    if require_transparency and transparency_present and not result.transparency_verified:
+        result.warnings.append(
+            "transparency receipt is present but was not independently verified "
+            "against a trusted transparency-service policy"
+        )
+        transparency_unverifiable = require_transparency
+    elif require_transparency and not transparency_present:
+        result.warnings.append("no transparency receipt was supplied")
+
     # --- Final result (fail-closed: VALID requires a verified signature and
     # a verifiable delegation chain - spec 5.3)
     result.mismatch_details = mismatches
@@ -1120,13 +1233,19 @@ def verify_manifest(
         # Signature present but no trusted keys (or verification never ran) -
         # the manifest cannot be authenticated. Never VALID.
         result.result = OverallResult.UNVERIFIABLE
+    elif transparency_unverifiable and OverallResult.VALID == result.result:
+        result.result = OverallResult.UNVERIFIABLE
     elif fields.delegation_chain == DelegationResult.UNVERIFIABLE:
+        result.result = OverallResult.UNVERIFIABLE
+    elif fields.hitl_record == HitlResult.UNVERIFIABLE:
         result.result = OverallResult.UNVERIFIABLE
     elif OverallResult.VALID == result.result:
         # A composition-only document authenticates a contribution to a future
         # agent, not a complete agent instance. INCOMPLETE is deliberate: it
         # can be verified and inspected but cannot be mistaken for Level 0.
         if manifest.get("profile") == "composition-only":
+            result.result = OverallResult.INCOMPLETE
+        elif require_transparency and not transparency_present:
             result.result = OverallResult.INCOMPLETE
         # VERIFY-001: bound artifacts with no runtime hashes in strict mode
         elif context.strict_artifact_verification and unverified_bound:
@@ -1240,11 +1359,6 @@ def _verify_cose_envelope(
         payload_manifest, context, revocation_store, _envelope=envelope
     )
 
-    if not envelope.receipts:
-        result.warnings.append(
-            "no transparency receipt in the unprotected header (label 394); "
-            "a production manifest is expected to carry one"
-        )
     return result
 
 
@@ -1400,8 +1514,10 @@ def create_router(
         The request body carries ``trusted_keys`` (key_id -> base64url public
         key) used for manifest signature verification, optionally
         ``trusted_key_issuers`` (key_id -> issuer SPIFFE URIs) for key issuer
-        authorization, and optionally ``delegation_public_keys`` (principal_id
-        -> base64url public key) for delegation chain verification.
+        authorization, optionally ``delegation_public_keys`` (principal_id ->
+        base64url public key) for delegation chain verification, and optionally
+        ``approver_public_keys`` (approver_id -> base64url Ed25519 public key)
+        for HITL approval verification.
         Verification is fail-closed - see :func:`verify_manifest`.
         """
         manifest = _lookup_manifest(request.manifest_id)
@@ -1411,6 +1527,11 @@ def create_router(
             trusted_keys=request.trusted_keys,
             trusted_key_issuers=request.trusted_key_issuers,
             delegation_public_keys=request.delegation_public_keys,
+            approver_public_keys=request.approver_public_keys,
+            verified_transparency_entry_ids=request.verified_transparency_entry_ids,
+            verified_transparency_receipt_hashes=request.verified_transparency_receipt_hashes,
+            transparency_evidence_manifest_id=request.transparency_evidence_manifest_id,
+            require_transparency=request.require_transparency,
             require_delegation=request.require_delegation,
         )
         return verify_manifest(manifest, ctx, revocation_store)

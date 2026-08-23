@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Fixed
+
+- **[SECURITY][SDK]** The integrated verification path now authenticates every
+  enforced HITL approval against a trusted approver key and binds that approval
+  to the manifest being verified. Missing keys, malformed or invalid approval
+  signatures, and approvals replayed from another manifest fail closed. See
+  GHSA-ww2p-prj4-c6xf.
+
+- **[SECURITY][SDK]** Bound runtime artifacts now fail closed when their
+  observed hashes are absent. Signature-only appraisal remains available only
+  through an explicit API or CLI opt-out and must not be used as authorization
+  evidence about a deployed agent.
+
+- **[SECURITY][SDK]** Transparency receipts are no longer treated as a warning-
+  only attachment at production conformance levels. Level 1+ (or explicit
+  `require_transparency`) requires an entry ID or receipt digest produced by an
+  independent appraisal against the relying party's trusted transparency-log
+  policy. An attacker-controlled receipt in a COSE unprotected header is
+  `UNVERIFIABLE`, not proof of inclusion.
+
 ### Added
 
 - **[SPEC][SDK]** Added configuration assurance for artifact #1 (spec 3.2.1.1,

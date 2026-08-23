@@ -52,7 +52,7 @@ from agent_manifest._cose import (
     payload_hash,
     sign_cose_sign1,
 )
-from agent_manifest._delegation import DelegationHopSigner
+from agent_manifest._delegation import DelegationHopSigner, HitlApprovalSigner
 from agent_manifest._signing import (
     Ed25519Signer,
     ed25519_from_private_bytes,
@@ -76,6 +76,7 @@ assert (KP.key_id, KP.public_b64url()) == (KEY_ID, PUBLIC_KEY_B64URL), (
     "fixed signing key drifted from the published public key/key_id constants"
 )
 TRUSTED_KEYS = {KEY_ID: PUBLIC_KEY_B64URL}
+APPROVER_ID = "mailto:alice@example.com"
 
 # Stable absolute timestamps (never "now").
 ISSUED_AT = "2025-01-01T00:00:00Z"
@@ -698,13 +699,23 @@ def build() -> list[dict[str, Any]]:
     m = base_manifest(hitl_record={
         "required": True,
         "approvals": [{
+            "approver_id": APPROVER_ID,
             "approved_at": ISSUED_AT,
             "approved_scope": {"approval_duration_seconds": CENTURY_SECONDS},
+            "approval_signature": HitlApprovalSigner(KP).sign_approval(
+                manifest_id=MANIFEST_ID,
+                approved_at=ISSUED_AT,
+                approved_scope={"approval_duration_seconds": CENTURY_SECONDS},
+                approver_id=APPROVER_ID,
+            ),
         }],
     })
     vectors.append(_vector(
         "AM-VEC-009", "Required HITL with an unexpired approval passes under enforce_hitl.",
-        ["3.2.10", "5.3"], m, base_context(enforce_hitl=True),
+        ["3.2.10", "5.3"], m, base_context(
+            enforce_hitl=True,
+            approver_public_keys={APPROVER_ID: PUBLIC_KEY_B64URL},
+        ),
         {"result": "VALID", "fields_verified": {"hitl_record": "APPROVED"}},
     ))
 

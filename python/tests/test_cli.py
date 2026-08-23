@@ -85,7 +85,10 @@ def test_cli_verify_with_matching_public_key_is_valid(tmp_path):
 
     result = CliRunner().invoke(
         cli,
-        ["verify", str(signed_path), "--public-key", str(public_path)],
+        [
+            "verify", str(signed_path), "--public-key", str(public_path),
+            "--signature-only",
+        ],
     )
 
     payload = _json_stdout(result)
@@ -147,10 +150,10 @@ def test_cli_verify_with_missing_public_key_file_fails_cleanly(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_cli_verify_bound_artifacts_without_runtime_hashes_qualifies_valid(tmp_path):
+def test_cli_verify_bound_artifacts_without_runtime_hashes_is_incomplete(tmp_path):
     # The manifest binds system_prompt and policy_bundle hashes, but the CLI
     # supplies no runtime hashes, so those bindings are never compared. The
-    # output must qualify the VALID status and warn - never a bare "VALID".
+    # safe default must not turn signature validity into artifact validity.
     keypair = generate_ed25519()
     signed_path = _write_signed_manifest(tmp_path, keypair)
     public_path = _write_public_key(tmp_path, keypair)
@@ -160,16 +163,65 @@ def test_cli_verify_bound_artifacts_without_runtime_hashes_qualifies_valid(tmp_p
         ["verify", str(signed_path), "--public-key", str(public_path)],
     )
 
-    # Signature is genuinely valid (exit 0), but the status must be qualified.
+    assert result.exit_code == 1
+    payload = _json_stdout(result)
+    assert payload["result"] == "INCOMPLETE"
+    assert "Result: INCOMPLETE" in result.output
+    assert any("artifact bindings NOT verified" in w for w in payload["warnings"])
+
+
+def test_cli_required_transparency_missing_is_incomplete(tmp_path):
+    keypair = generate_ed25519()
+    signed_path = _write_signed_manifest(tmp_path, keypair)
+    public_path = _write_public_key(tmp_path, keypair)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "verify", str(signed_path), "--public-key", str(public_path),
+            "--signature-only", "--require-transparency",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _json_stdout(result)
+    assert payload["result"] == "INCOMPLETE"
+    assert payload["transparency_verified"] is False
+
+
+def test_cli_verified_legacy_transparency_entry_is_valid(tmp_path):
+    keypair = generate_ed25519()
+    manifest = _signed_manifest(keypair)
+    entry_id = "rekor-cli-entry"
+    manifest["transparency_log_entry"] = {
+        "log_id": "0" * 64,
+        "log_index": 1,
+        "entry_uuid": entry_id,
+        "integrated_time": 1,
+        "inclusion_proof": {
+            "checkpoint": "signed-checkpoint",
+            "hashes": [],
+            "tree_size": 1,
+        },
+    }
+    signed_path = tmp_path / "signed-with-receipt.json"
+    signed_path.write_text(json.dumps(manifest))
+    public_path = _write_public_key(tmp_path, keypair)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "verify", str(signed_path), "--public-key", str(public_path),
+            "--signature-only", "--require-transparency",
+            "--verified-transparency-entry-id", entry_id,
+            "--transparency-evidence-manifest-id", manifest["manifest_id"],
+        ],
+    )
+
     assert result.exit_code == 0
     payload = _json_stdout(result)
     assert payload["result"] == "VALID"
-    assert "VALID (signature only - artifact bindings NOT verified)" in result.output
-    assert "WARNING" in result.output
-    # The bare "Result: VALID" line must NOT be emitted in this case.
-    assert "Result: VALID\n" not in result.output
-    # And the result payload carries the machine-readable warning too.
-    assert any("artifact bindings NOT verified" in w for w in payload["warnings"])
+    assert payload["transparency_verified"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +248,10 @@ def test_deprecated_nested_invocation_still_works(tmp_path):
 
     result = CliRunner().invoke(
         cli,
-        ["manifest", "verify", str(signed_path), "--public-key", str(public_path)],
+        [
+            "manifest", "verify", str(signed_path), "--public-key", str(public_path),
+            "--signature-only",
+        ],
     )
 
     assert result.exit_code == 0
