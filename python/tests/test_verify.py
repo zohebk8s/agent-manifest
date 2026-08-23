@@ -317,12 +317,16 @@ def test_attestation_hash_mismatch_with_enforce_raises_mismatch():
     assert any(d.field == "attestation" for d in result.mismatch_details)
 
 
-def test_attestation_hash_mismatch_without_enforce_is_valid():
+def test_attestation_hash_mismatch_is_fatal_without_enforce():
+    """Issue #265: a present attestation that binds a different manifest is
+    a report about some other document. enforce_attestation governs whether
+    an attestation is required, not whether a wrong one counts."""
     m = base_manifest()
     m["attestation"] = {"platform": "tpm", "manifest_hash_in_report": "sha256:" + "00" * 32}
     result = verify_manifest(m, base_context(), store())
     assert result.attestation_verified is False
-    assert result.result == OverallResult.VALID
+    assert result.result == OverallResult.MISMATCH
+    assert [d for d in result.mismatch_details if d.field == "attestation"]
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +637,50 @@ def test_enforce_hitl_with_valid_approval_passes():
         }],
     })
     result = verify_manifest(m, base_context(enforce_hitl=True), store())
+    assert result.fields_verified.hitl_record == HitlResult.APPROVED
+    assert result.result == OverallResult.VALID
+
+
+def test_level_2_rejects_software_key_for_high_risk_approval():
+    approval_time = (NOW - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    m = base_manifest(hitl_record={
+        "required": True,
+        "approvals": [{
+            "approved_at": approval_time,
+            "approved_scope": {
+                "approval_duration_seconds": 7200,
+                "risk_tier": "high",
+            },
+            "approval_method": "software-key",
+        }],
+    })
+    result = verify_manifest(
+        m,
+        base_context(enforce_hitl=True, conformance_level=2),
+        store(),
+    )
+    assert result.fields_verified.hitl_record == HitlResult.APPROVAL_INSUFFICIENT
+    assert result.result == OverallResult.MISMATCH
+
+
+def test_level_2_accepts_hardware_key_for_high_risk_approval():
+    approval_time = (NOW - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    m = base_manifest(hitl_record={
+        "required": True,
+        "approvals": [{
+            "approved_at": approval_time,
+            "approved_scope": {
+                "approval_duration_seconds": 7200,
+                "risk_tier": "high",
+            },
+            "approval_method": "hardware-key",
+        }],
+    })
+    result = verify_manifest(
+        m,
+        base_context(enforce_hitl=True, conformance_level=2),
+        store(),
+    )
     assert result.fields_verified.hitl_record == HitlResult.APPROVED
     assert result.result == OverallResult.VALID
 

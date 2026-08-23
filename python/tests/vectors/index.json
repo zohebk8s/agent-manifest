@@ -1,7 +1,7 @@
 {
   "suite": "agent-manifest-verification",
-  "spec_version": "0.1",
-  "description": "Language-neutral verification conformance vectors. Each vector: a manifest, a VerificationContext, and the expected VerificationResult.",
+  "spec_version": "0.2",
+  "description": "Language-neutral verification conformance vectors. Each vector: a manifest or a COSE envelope, a VerificationContext, and the expected VerificationResult.",
   "envelopes": {
     "manifest": "v0.1 detached signature over an RFC 8785 pre-image",
     "envelope_hex": "v0.2 COSE_Sign1 / COSE_Sign, CBOR"
@@ -99,6 +99,11 @@
       "description": "Attestation report hash matching the canonical manifest hash verifies."
     },
     {
+      "id": "AM-VEC-021",
+      "file": "AM-VEC-021.json",
+      "description": "Attestation carried forward onto a re-signed manifest binds the previous document."
+    },
+    {
       "id": "AM-VEC-019",
       "file": "AM-VEC-019.json",
       "description": "Signed single-hop delegation chain bound to the manifest issuer verifies."
@@ -109,9 +114,89 @@
       "description": "Post-quantum crypto_profile with an Ed25519 signature is a downgrade."
     },
     {
+      "id": "AM-VEC-022",
+      "file": "AM-VEC-022.json",
+      "description": "A trusted key not authorized for the manifest's issuer is rejected."
+    },
+    {
+      "id": "AM-VEC-023",
+      "file": "AM-VEC-023.json",
+      "description": "A key authorized for the subject (agent_id) but not the issuer is rejected."
+    },
+    {
       "id": "AM-VEC-COSE-001",
       "file": "AM-VEC-COSE-001.json",
       "description": "COSE_Sign1 encoding is pinned byte-for-byte: CBOR tag 18, a four-element array, and a zero-length unprotected header map before any receipt is attached."
+    },
+    {
+      "id": "AM-VEC-COSE-002",
+      "file": "AM-VEC-COSE-002.json",
+      "description": "A tampered protected header invalidates the signature."
+    },
+    {
+      "id": "AM-VEC-COSE-003",
+      "file": "AM-VEC-COSE-003.json",
+      "description": "alg present in the unprotected header is rejected, never read."
+    },
+    {
+      "id": "AM-VEC-COSE-004",
+      "file": "AM-VEC-COSE-004.json",
+      "description": "A vendor-tree typ alias is rejected. The signature over this envelope is valid, so typ is the only defect."
+    },
+    {
+      "id": "AM-VEC-COSE-005",
+      "file": "AM-VEC-COSE-005.json",
+      "description": "An unprotected header injected after signing does not change the verdict: kid is read from the protected header only."
+    },
+    {
+      "id": "AM-VEC-COSE-006",
+      "file": "AM-VEC-COSE-006.json",
+      "description": "An untagged COSE structure is rejected rather than inferred."
+    },
+    {
+      "id": "AM-VEC-COSE-007",
+      "file": "AM-VEC-COSE-007.json",
+      "description": "Trailing bytes after the COSE object are rejected."
+    },
+    {
+      "id": "AM-VEC-COSE-008",
+      "file": "AM-VEC-COSE-008.json",
+      "description": "A detached (nil) payload is rejected; this profile is inline only."
+    },
+    {
+      "id": "AM-VEC-COSE-009",
+      "file": "AM-VEC-COSE-009.json",
+      "description": "A trusted key not authorized for the manifest's issuer is rejected. The envelope is byte-identical to AM-VEC-COSE-001 and the signature verifies; only the issuer binding differs."
+    },
+    {
+      "id": "AM-VEC-COSE-010",
+      "file": "AM-VEC-COSE-010.json",
+      "description": "A payload with a duplicate member name is rejected rather than resolved. The signature over these bytes is valid: the two issuer values are the only defect."
+    },
+    {
+      "id": "AM-VEC-COSE-011",
+      "file": "AM-VEC-COSE-011.json",
+      "description": "A payload containing the non-JSON literal NaN is rejected, not accepted as a parser extension. The signature over these bytes is valid."
+    },
+    {
+      "id": "AM-VEC-COSE-012",
+      "file": "AM-VEC-COSE-012.json",
+      "description": "A payload declaring version 0.1 inside a 0.2 COSE envelope returns INCOMPATIBLE_VERSION. The envelope is well formed and the signature over it is valid."
+    },
+    {
+      "id": "AM-VEC-COSE-013",
+      "file": "AM-VEC-COSE-013.json",
+      "description": "A payload nested past the accepted depth is rejected with a verdict, not a stack exhaustion. The signature over these bytes is valid."
+    },
+    {
+      "id": "AM-VEC-COSE-014",
+      "file": "AM-VEC-COSE-014.json",
+      "description": "A version 0.2 manifest presented with a v0.1 detached signature block is rejected. The signature is valid and the version is supported; the envelope is the defect."
+    },
+    {
+      "id": "AM-VEC-COSE-015",
+      "file": "AM-VEC-COSE-015.json",
+      "description": "A payload containing the non-JSON literal Infinity is rejected. Companion to AM-VEC-COSE-011: a verifier that special-cases NaN passes that one and fails this. The signature over these bytes is valid."
     }
   ]
 }

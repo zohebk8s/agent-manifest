@@ -39,24 +39,29 @@
         "manifest_id",
         "previous_manifest_id",
         "agent_id",
+        "agent_instance_id",
         "version",
         "min_verifier_version",
         "issued_at",
         "expires_at",
         "issuer",
         "crypto_profile",
+        "profile",
+        "unbound_artifacts",
+        "source_bundle",
         "artifacts",
         "delegation_chain",
         "hitl_record",
         "prior_transparency_log_entry",
         "log_retention",
         "data_scope",
-        "operational_lifecycle"
+        "operational_lifecycle",
+        "intent"
       ]
     },
     "attestation": {
       "platform": "tpm",
-      "manifest_hash_in_report": "sha256:55a8dfda7985bf883ae26ef4a487ba5aa689640c0d633fd03bd909fe9f37b4e9"
+      "manifest_hash_in_report": "sha256:f1cbdacb5191606917f4340ab8340c1e0eaa471004430a9811df83200324090d"
     }
   },
   "context": {

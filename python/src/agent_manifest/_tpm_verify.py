@@ -12,8 +12,9 @@ Verification is fail-closed, in four steps:
 2. The attestation-key (AK) certificate chain is verified up to a
    caller-supplied trusted root (leaf issued-by next, root pinned by
    SHA-256 fingerprint). A self-signed AK is never trusted on its own.
-3. The AK signature over the ``TPMS_ATTEST`` blob is verified (ECDSA-P256 or
-   RSA PKCS#1 v1.5, both over SHA-256).
+3. The AK signature over the ``TPMS_ATTEST`` blob is verified. Bare signatures
+   retain the legacy SHA-256 behavior; a ``TPMT_SIGNATURE`` selects RSASSA,
+   RSAPSS, or ECDSA and SHA-256, SHA-384, or SHA-512 from its signed envelope.
 4. The qualifying data (the verifier's nonce, carried in ``extraData``) and the
    PCR digest (the platform measurement) are checked against expected values
    with constant-time compares.
@@ -52,6 +53,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 TPM_GENERATED_VALUE = 0xFF544347
+TPM_ST_ATTEST_NV = 0x8014
 TPM_ST_ATTEST_QUOTE = 0x8018
 _CLOCK_INFO_LEN = 17
 _FIRMWARE_VERSION_LEN = 8
@@ -80,6 +82,25 @@ def _read_2b(buf: bytes, pos: int) -> tuple[bytes, int]:
 
 
 @dataclass(frozen=True)
+class TpmAttest:
+    """Common header and type-specific payload of a ``TPMS_ATTEST``.
+
+    The bytes after the common header are intentionally left opaque.  Callers
+    inspect ``attest_type`` before passing ``attested_raw`` to a parser for the
+    corresponding member of the ``TPMU_ATTEST`` union.
+    """
+
+    magic: int
+    attest_type: int
+    qualified_signer: bytes
+    qualifying_data: bytes
+    clock_info: bytes
+    firmware_version: int
+    attested_raw: bytes
+    raw: bytes
+
+
+@dataclass(frozen=True)
 class TpmQuote:
     """The parsed subset of a TPM 2.0 quote (TPMS_ATTEST) that is appraised."""
 
@@ -88,6 +109,23 @@ class TpmQuote:
     qualifying_data: bytes  # extraData: the verifier's nonce
     pcr_digest: bytes  # the platform measurement
     raw: bytes
+
+
+@dataclass(frozen=True)
+class NvCertifyInfo:
+    """The parsed ``TPMS_NV_CERTIFY_INFO`` member of ``TPMU_ATTEST``."""
+
+    index_name: bytes
+    offset: int
+    nv_contents: bytes
+
+
+@dataclass(frozen=True)
+class TpmNvCertify:
+    """A type-checked TPM NV certification and its signed common header."""
+
+    attest: TpmAttest
+    info: NvCertifyInfo
 
 
 def _unwrap_attest(data: bytes) -> bytes:
@@ -105,7 +143,7 @@ def _unwrap_attest(data: bytes) -> bytes:
     if int.from_bytes(data[0:4], "big") == TPM_GENERATED_VALUE:
         return data
     size = int.from_bytes(data[0:2], "big")
-    if 0 < size <= len(data) - 2:
+    if 0 < size == len(data) - 2:
         inner = data[2:2 + size]
         if len(inner) >= 4 and int.from_bytes(inner[0:4], "big") == TPM_GENERATED_VALUE:
             return inner
@@ -115,6 +153,70 @@ def _unwrap_attest(data: bytes) -> bytes:
     )
 
 
+def parse_tpm_attest(attest: bytes) -> TpmAttest:
+    """Parse the common ``TPMS_ATTEST`` header without assuming a union type.
+
+    Accepts the same bare and ``TPM2B_ATTEST`` framings as
+    :func:`parse_tpm_quote`.  ``attested_raw`` starts at the ``TPMU_ATTEST``
+    union, while ``raw`` is the complete inner structure signed by the AK.
+    """
+    attest = _unwrap_attest(attest)
+    if len(attest) < 6:
+        raise TpmVerificationError("TPM attestation too short")
+    magic = int.from_bytes(attest[0:4], "big")
+    attest_type, pos = _read_u16(attest, 4)
+    qualified_signer, pos = _read_2b(attest, pos)
+    qualifying_data, pos = _read_2b(attest, pos)
+    if pos + _CLOCK_INFO_LEN + _FIRMWARE_VERSION_LEN > len(attest):
+        raise TpmVerificationError("TPM attestation truncated reading clock or firmware data")
+    clock_info = bytes(attest[pos:pos + _CLOCK_INFO_LEN])
+    pos += _CLOCK_INFO_LEN
+    firmware_version = int.from_bytes(attest[pos:pos + _FIRMWARE_VERSION_LEN], "big")
+    pos += _FIRMWARE_VERSION_LEN
+    return TpmAttest(
+        magic=magic,
+        attest_type=attest_type,
+        qualified_signer=qualified_signer,
+        qualifying_data=qualifying_data,
+        clock_info=clock_info,
+        firmware_version=firmware_version,
+        attested_raw=bytes(attest[pos:]),
+        raw=bytes(attest),
+    )
+
+
+def parse_nv_certify_info(attested_raw: bytes) -> NvCertifyInfo:
+    """Parse a ``TPMS_NV_CERTIFY_INFO`` union payload.
+
+    The caller must first use :func:`parse_tpm_attest` and require
+    ``attest_type == TPM_ST_ATTEST_NV``.  Keeping the common-header and union
+    parsers separate prevents a quote from being silently interpreted as an NV
+    certify while still allowing consumers to branch on the signed type.
+    """
+    index_name, pos = _read_2b(attested_raw, 0)
+    offset, pos = _read_u16(attested_raw, pos)
+    nv_contents, pos = _read_2b(attested_raw, pos)
+    if pos != len(attested_raw):
+        raise TpmVerificationError(
+            "TPMS_NV_CERTIFY_INFO has trailing bytes after nvContents"
+        )
+    return NvCertifyInfo(
+        index_name=index_name,
+        offset=offset,
+        nv_contents=nv_contents,
+    )
+
+
+def parse_tpm_nv_certify(attest: bytes) -> TpmNvCertify:
+    """Parse a full NV-certify attestation and enforce its signed union type."""
+    common = parse_tpm_attest(attest)
+    if common.attest_type != TPM_ST_ATTEST_NV:
+        raise TpmVerificationError(
+            f"attestation is not an NV certify (type={common.attest_type:#x})"
+        )
+    return TpmNvCertify(attest=common, info=parse_nv_certify_info(common.attested_raw))
+
+
 def parse_tpm_quote(attest: bytes) -> TpmQuote:
     """Parse a quote blob into its appraised fields.
 
@@ -122,31 +224,30 @@ def parse_tpm_quote(attest: bytes) -> TpmQuote:
     returned ``raw`` is always the inner ``TPMS_ATTEST``, which is the byte range
     the attestation key signed and therefore what a signature check must cover.
     """
-    attest = _unwrap_attest(attest)
-    if len(attest) < 6:
-        raise TpmVerificationError("TPM quote too short")
-    magic = int.from_bytes(attest[0:4], "big")
-    attest_type, pos = _read_u16(attest, 4)
-    _qualified_signer, pos = _read_2b(attest, pos)  # TPM2B_NAME
-    qualifying_data, pos = _read_2b(attest, pos)  # extraData / nonce
-    pos += _CLOCK_INFO_LEN + _FIRMWARE_VERSION_LEN
+    common = parse_tpm_attest(attest)
+    if common.attest_type != TPM_ST_ATTEST_QUOTE:
+        raise TpmVerificationError(
+            f"attestation is not a quote (type={common.attest_type:#x})"
+        )
+    attested = common.attested_raw
+    pos = 0
     # TPML_PCR_SELECTION
-    if pos + 4 > len(attest):
+    if pos + 4 > len(attested):
         raise TpmVerificationError("TPM quote truncated reading PCR selection count")
-    count = int.from_bytes(attest[pos:pos + 4], "big")
+    count = int.from_bytes(attested[pos:pos + 4], "big")
     pos += 4
     for _ in range(count):
-        if pos + 3 > len(attest):
+        if pos + 3 > len(attested):
             raise TpmVerificationError("TPM quote truncated reading a PCR selection")
-        size_of_select = attest[pos + 2]
+        size_of_select = attested[pos + 2]
         pos += 3 + size_of_select
-    pcr_digest, _pos = _read_2b(attest, pos)
+    pcr_digest, _pos = _read_2b(attested, pos)
     return TpmQuote(
-        magic=magic,
-        attest_type=attest_type,
-        qualifying_data=qualifying_data,
+        magic=common.magic,
+        attest_type=common.attest_type,
+        qualifying_data=common.qualifying_data,
         pcr_digest=pcr_digest,
-        raw=bytes(attest),
+        raw=common.raw,
     )
 
 
@@ -185,7 +286,10 @@ def parse_tpmt_signature(blob: bytes) -> ParsedSignature:
             offset += 2
             if len(blob) < offset + size:
                 raise TpmVerificationError("TPMT_SIGNATURE truncated inside the RSA signature")
-            return ParsedSignature(sig_alg, hash_alg, blob[offset:offset + size])
+            offset += size
+            if offset != len(blob):
+                raise TpmVerificationError("TPMT_SIGNATURE has trailing bytes")
+            return ParsedSignature(sig_alg, hash_alg, blob[offset - size:offset])
 
         if sig_alg == _ALG_ECDSA:
             from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
@@ -200,6 +304,8 @@ def parse_tpmt_signature(blob: bytes) -> ParsedSignature:
                     )
                 parts.append(blob[offset:offset + size])
                 offset += size
+            if offset != len(blob):
+                raise TpmVerificationError("TPMT_SIGNATURE has trailing bytes")
             return ParsedSignature(
                 sig_alg,
                 hash_alg,
@@ -247,7 +353,7 @@ def _verify_ak_chain(ak_chain_pem: bytes, trusted_roots_pem: bytes) -> "object":
 
 def verify_tpm_quote(
     attest: bytes,
-    signature: bytes,
+    signature: bytes | ParsedSignature,
     ak_chain_pem: bytes,
     *,
     trusted_roots_pem: bytes,
@@ -258,8 +364,10 @@ def verify_tpm_quote(
 
     Args:
         attest: the raw ``TPMS_ATTEST`` blob the TPM signed.
-        signature: the AK signature over ``attest`` (DER ECDSA-P256 or RSA
-            PKCS#1 v1.5, SHA-256).
+        signature: either the legacy bare AK signature (DER ECDSA or RSA
+            PKCS#1 v1.5 over SHA-256), a parsed :class:`ParsedSignature`, or a
+            marshalled ``TPMT_SIGNATURE``. Envelopes select RSASSA, RSAPSS, or
+            ECDSA and SHA-256, SHA-384, or SHA-512 from their algorithm ids.
         ak_chain_pem: the AK certificate chain (PEM, leaf first).
         trusted_roots_pem: the caller's trusted vendor EK/AK roots (PEM).
         expected_qualifying_data: if given, the quote's ``extraData`` (nonce)
@@ -275,8 +383,8 @@ def verify_tpm_quote(
     """
     try:
         from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
-        from cryptography.hazmat.primitives.hashes import SHA256
     except ImportError as e:  # pragma: no cover
         raise TpmVerificationError(
             "TPM quote verification requires the 'cryptography' package"
@@ -303,11 +411,55 @@ def verify_tpm_quote(
     # signed the inner structure, so verifying over the outer bytes would fail a
     # genuine quote.
     signed = quote.raw
+    parsed_signature: ParsedSignature | None = None
+    if isinstance(signature, ParsedSignature):
+        parsed_signature = signature
+    elif len(signature) >= 2 and int.from_bytes(signature[:2], "big") in (
+        _ALG_RSASSA,
+        _ALG_RSAPSS,
+        _ALG_ECDSA,
+    ):
+        parsed_signature = parse_tpmt_signature(signature)
+
+    if parsed_signature is None:
+        assert isinstance(signature, bytes)
+        bare_signature = signature
+        signature_algorithm = None
+        digest: hashes.HashAlgorithm = hashes.SHA256()
+    else:
+        bare_signature = parsed_signature.signature
+        signature_algorithm = parsed_signature.sig_alg
+        if parsed_signature.hash_alg == 0x000B:
+            digest = hashes.SHA256()
+        elif parsed_signature.hash_alg == 0x000C:
+            digest = hashes.SHA384()
+        elif parsed_signature.hash_alg == 0x000D:
+            digest = hashes.SHA512()
+        else:
+            raise TpmVerificationError(
+                f"unsupported hash algorithm 0x{parsed_signature.hash_alg:04x}"
+            )
+
     try:
         if isinstance(ak_key, ec.EllipticCurvePublicKey):
-            ak_key.verify(signature, signed, ec.ECDSA(SHA256()))
+            if signature_algorithm not in (None, _ALG_ECDSA):
+                raise TpmVerificationError(
+                    "TPMT_SIGNATURE algorithm does not match the EC attestation key"
+                )
+            ak_key.verify(bare_signature, signed, ec.ECDSA(digest))
         elif isinstance(ak_key, rsa.RSAPublicKey):
-            ak_key.verify(signature, signed, padding.PKCS1v15(), SHA256())
+            signature_padding: padding.AsymmetricPadding
+            if signature_algorithm in (None, _ALG_RSASSA):
+                signature_padding = padding.PKCS1v15()
+            elif signature_algorithm == _ALG_RSAPSS:
+                signature_padding = padding.PSS(
+                    mgf=padding.MGF1(digest), salt_length=digest.digest_size
+                )
+            else:
+                raise TpmVerificationError(
+                    "TPMT_SIGNATURE algorithm does not match the RSA attestation key"
+                )
+            ak_key.verify(bare_signature, signed, signature_padding, digest)
         else:
             raise TpmVerificationError("unsupported AK public-key type for TPM quote")
     except InvalidSignature:

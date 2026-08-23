@@ -54,6 +54,33 @@ class ModelAttestationType(str, Enum):
     provider_asserted = "provider-asserted"
 
 
+class ManifestProfile(str, Enum):
+    """The assurance scope of an Agent Manifest (spec Section 3.1)."""
+
+    composition_only = "composition-only"
+
+
+class SourceBundleFormat(str, Enum):
+    """Packaging formats a signed manifest can bind as its source."""
+
+    agent_plugins_1_0_0 = "agent-plugins-1.0.0"
+
+
+class ArtifactName(str, Enum):
+    """Names that may be declared outside a composition-only binding."""
+
+    system_prompt = "system_prompt"
+    policy_bundle = "policy_bundle"
+    tool_manifest = "tool_manifest"
+    model_identity = "model_identity"
+    rag_corpus = "rag_corpus"
+    memory_baseline = "memory_baseline"
+    decision_trace = "decision_trace"
+    delegation_chain = "delegation_chain"
+    supply_chain = "supply_chain"
+    hitl_record = "hitl_record"
+
+
 class MemoryType(str, Enum):
     none = "none"
     session = "session"
@@ -94,6 +121,16 @@ class PoisoningResult(str, Enum):
     clean = "clean"
     flagged = "flagged"
     not_scanned = "not-scanned"
+
+
+class AssuranceResult(str, Enum):
+    """Spec 3.2.1.1. Deliberately not reusing PoisoningResult: `clean` reads as
+    a property of the artifact, and an assessment result is a property of the
+    suite that was run."""
+
+    passed = "passed"
+    flagged = "flagged"
+    not_assessed = "not-assessed"
 
 
 class ApprovalMethod(str, Enum):
@@ -373,9 +410,50 @@ class OperationalLifecycle(SpecModel):
     reissuance_triggers: list[str] = Field(default_factory=list)
 
 
+class SourceBundleBinding(SpecModel):
+    """Signed binding to the package from which this manifest was derived."""
+
+    format: SourceBundleFormat
+    digest: HashValue
+
+
 # ---------------------------------------------------------------------------
 # Artifact bindings - one per spec section 3.2.x
 # ---------------------------------------------------------------------------
+
+
+class AssuranceTest(SpecModel):
+    """Bound behavioural assessment of artifact #1 - spec Section 3.2.1.1.
+
+    Same shape and the same normative force as PoisoningScan is to the RAG
+    corpus: an assessment that ran and flagged cannot be issued as VALID. The
+    absence of one is reported rather than treated as a pass, because
+    `system_prompt.hash` proves which prompt was approved and nothing about
+    whether the approved prompt behaves acceptably.
+
+    A `passed` result asserts "this suite, at this version, found nothing". It
+    does not assert that nothing is there; the suite's coverage bounds the
+    claim, which is why suite_id and suite_version are REQUIRED.
+    """
+
+    suite_id: str
+    suite_version: str
+    harness_version: str
+    result: AssuranceResult
+    assessed_at: Optional[datetime] = None
+    scenario_count: Optional[int] = Field(default=None, gt=0)
+    evidence_uri: Optional[str] = None
+    evidence_digest: Optional[HashValue] = None
+    assessed_by: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_assessed_at(self) -> "AssuranceTest":
+        if self.result != AssuranceResult.not_assessed and self.assessed_at is None:
+            raise ValueError(
+                "assessed_at is REQUIRED when result is 'passed' or 'flagged' "
+                "(spec Section 3.2.1.1)"
+            )
+        return self
 
 
 class SystemPromptBinding(SpecModel):
@@ -386,7 +464,11 @@ class SystemPromptBinding(SpecModel):
     version: str
     classification: DataClassification
     language: Optional[str] = None
+    # An operator assertion with no defined value space and no verification
+    # behaviour (spec 3.2.1); named as such so the field name is not read as
+    # the assurance signal it resembles. Evidence goes in assurance_test.
     safety_level: Optional[str] = None
+    assurance_test: Optional[AssuranceTest] = None
     bound_at: datetime
 
 
@@ -584,6 +666,29 @@ class DecisionTraceBinding(SpecModel):
         return self
 
 
+class AuditCheckpointBinding(SpecModel):
+    """Artifact #7 checkpoint anchor - spec Section 3.2.7.1 (v0.2).
+
+    Additive companion to DecisionTraceBinding, mirroring what
+    MemoryCheckpointBinding is to MemoryBaselineBinding. `audit_chain_root` in
+    Section 3.2.7 is the chain state at manifest signing time; this is the
+    chain state a runtime serves later, carrying the `tree_size` and `seq` a
+    verifier needs to check that the later state descends from the signed one
+    (see `_audit_continuity.verify_continuity`). Section 3.2.7 semantics are
+    unchanged: without continuity evidence a diverged root is still MISMATCH.
+
+    ttl_seconds: min 60 (audit freshness is measured in minutes, not hours),
+    max 7776000 (90 days), matching the memory checkpoint ceiling.
+    """
+
+    audit_chain_root: HashValue
+    tree_size: int = Field(ge=0)
+    seq: int = Field(ge=0)
+    observed_at: datetime
+    ttl_seconds: int = Field(ge=60, le=7_776_000)
+    checkpoint_signature: Optional[str] = None
+
+
 class SupplyChainBinding(SpecModel):
     """Artifact #9 - spec Section 3.2.8 (renumbered from 3.2.7 in #24)."""
 
@@ -632,10 +737,10 @@ class HitlRecord(SpecModel):
 class ArtifactBindings(SpecModel):
     """Container for the 8 artifact bindings that live under `artifacts`."""
 
-    system_prompt: SystemPromptBinding
-    policy_bundle: PolicyBundleBinding
+    system_prompt: Optional[SystemPromptBinding] = None
+    policy_bundle: Optional[PolicyBundleBinding] = None
     tool_manifest: Optional[ToolManifestBinding] = None
-    model_identity: ModelIdentityBinding
+    model_identity: Optional[ModelIdentityBinding] = None
     rag_corpus: Optional[RagCorpusBinding] = None
     memory_baseline: Optional[MemoryBaselineBinding] = None
     decision_trace: Optional[DecisionTraceBinding] = None
@@ -700,12 +805,21 @@ class Manifest(SpecModel):
     manifest_id: ManifestId
     previous_manifest_id: Optional[ManifestId] = None
     agent_id: str  # SPIFFE URI
+    # OPTIONAL. Present only on an instance-scoped manifest, where it is the
+    # session-scoped identity (OCSF ai_agent.instance_uid); agent_id stays the
+    # stable one (OCSF ai_agent.uid). Spec 3.1 / 6.4.2.
+    agent_instance_id: Optional[ManifestId] = None
     version: str = "0.1"
     min_verifier_version: Optional[str] = None
     issued_at: datetime
     expires_at: datetime
     issuer: str  # SPIFFE URI of signing authority
     crypto_profile: CryptoProfile = CryptoProfile.standard
+    # Absent means the original full-binding manifest profile. Keeping the
+    # default absent preserves the signing bytes of every existing manifest.
+    profile: Optional[ManifestProfile] = None
+    unbound_artifacts: Optional[list[ArtifactName]] = None
+    source_bundle: Optional[SourceBundleBinding] = None
     artifacts: ArtifactBindings
     # attestation is appended by the TEE at launch - excluded from signature pre-image
     attestation: Optional[dict[str, Any]] = None
@@ -735,6 +849,61 @@ class Manifest(SpecModel):
             raise ValueError("expires_at must be at least 1 hour after issued_at")
         if delta > timedelta(days=365):
             raise ValueError("expires_at must not be more than 365 days after issued_at")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_manifest_profile(self) -> "Manifest":
+        nested_names = {
+            "system_prompt",
+            "policy_bundle",
+            "tool_manifest",
+            "model_identity",
+            "rag_corpus",
+            "memory_baseline",
+            "decision_trace",
+            "supply_chain",
+        }
+        bound = {
+            name for name in nested_names if getattr(self.artifacts, name) is not None
+        }
+        if self.delegation_chain is not None:
+            bound.add("delegation_chain")
+        if self.hitl_record is not None:
+            bound.add("hitl_record")
+
+        if self.profile is None:
+            if self.unbound_artifacts is not None:
+                raise ValueError(
+                    "unbound_artifacts is only valid when profile is 'composition-only'"
+                )
+            required = {"system_prompt", "policy_bundle", "model_identity"}
+            missing = sorted(required - bound)
+            if missing:
+                raise ValueError(
+                    "full-binding manifest is missing required artifacts: "
+                    + ", ".join(missing)
+                )
+            return self
+
+        declared = [name.value for name in self.unbound_artifacts or []]
+        if not declared:
+            raise ValueError(
+                "unbound_artifacts must be non-empty for profile 'composition-only'"
+            )
+        if len(declared) != len(set(declared)):
+            raise ValueError("unbound_artifacts must not contain duplicates")
+        overlap = sorted(bound & set(declared))
+        if overlap:
+            raise ValueError(
+                "artifacts cannot be both bound and declared unbound: "
+                + ", ".join(overlap)
+            )
+        undeclared = sorted({name.value for name in ArtifactName} - bound - set(declared))
+        if undeclared:
+            raise ValueError(
+                "composition-only manifest omits artifacts without declaring them unbound: "
+                + ", ".join(undeclared)
+            )
         return self
 
     @model_validator(mode="after")
