@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Deprecated
+
+- **[SPEC] Issuing v0.1 manifests ends 2026-11-30** (issue #315, phase 5). From that
+  date the reference implementation produces v0.2 COSE envelopes only. The date follows
+  phase 4 completing: `cmcp` and `ca2a` both verify a v0.2 envelope through their real
+  loader paths and both reject a payload declaring v0.1 under a v0.2 envelope
+  (`AM-VEC-COSE-012`), so a consumer is exercising v0.2 rather than a test harness.
+
+  **Verifying v0.1 manifests is not deprecated and has no end date.** These are audit
+  records with regulated retention well beyond their 90-day validity, and a verifier that
+  stops reading them destroys evidence rather than tidying a codebase. Same reasoning as
+  keeping the `-8` Ed25519 code point acceptable indefinitely.
+
+## [0.11.2] — 2026-08-27
+
+### Fixed
+
+- **[SECURITY][SDK]** `verify_manifest` now binds a declared
+  `artifacts.policy_bundle.enforcement_mode` to the runtime's attested mode.
+  A mismatch or an omitted runtime mode fails closed instead of accepting a
+  matching policy hash while the runtime operates with weaker enforcement.
+
+## [0.11.1] — 2026-08-23
+
 ### Fixed
 
 - **[SECURITY][SDK]** The integrated verification path now authenticates every
@@ -9,6 +33,12 @@
   to the manifest being verified. Missing keys, malformed or invalid approval
   signatures, and approvals replayed from another manifest fail closed. See
   GHSA-ww2p-prj4-c6xf.
+
+- **[SECURITY][CLI]** `manifest verify` gained `--approver-key
+  APPROVER_ID=PATH` (repeatable) to supply trusted HITL approver keys. Without
+  it the CLI had no input that could populate `approver_public_keys`, so every
+  approval resolved to `UNVERIFIABLE` and `--enforce-hitl` could not succeed.
+  A failing result now names the missing option.
 
 - **[SECURITY][SDK]** Bound runtime artifacts now fail closed when their
   observed hashes are absent. Signature-only appraisal remains available only
@@ -179,8 +209,6 @@ Each negative carries `signature_valid`, recording whether the Ed25519 signature
 - `verify_manifest()` now fails closed when a core identity, validity, or artifact-container claim is missing. A valid signature no longer turns such a structurally incomplete object into a `VALID` manifest; legacy v0.1 issuer omission remains compatible unless issuer authorization is configured.
 
 All notable changes to Agent Manifest are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Spec changes are marked **[SPEC]**; SDK changes are marked **[SDK]**.
-
-## [Unreleased]
 
 ### Added
 

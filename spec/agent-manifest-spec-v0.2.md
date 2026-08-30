@@ -168,6 +168,11 @@ Verifier requirements:
 - MUST check `version` before verifying. If the version is unsupported, MUST return `INCOMPATIBLE_VERSION` rather than silently misinterpreting fields.
 - SHOULD support at least the current and one prior minor version.
 
+<!-- CHANGED: #315 phase 5 - announce the v0.1 issuance end date -->
+**Issuing v0.1 manifests ends 2026-11-30.** From that date the reference implementation produces v0.2 COSE envelopes only, and a producer SHOULD NOT set `version` to `"0.1"`.
+
+**Verifying v0.1 manifests is not deprecated and has no end date.** Manifests are audit records under retention obligations that outlast their validity by years, so a verifier that stopped reading them would destroy evidence rather than remove code. `INCOMPATIBLE_VERSION` stays reserved for versions a verifier genuinely cannot interpret, never for v0.1.
+
 Compatibility matrix:
 
 | Producer version | Verifier supports | Result |
@@ -396,6 +401,9 @@ Deliberately open. Whether Level 2 conformance should require `result: passed`, 
 The policy bundle hash covers the complete Cedar policy set, including all policy templates and entity schemas. The `enforcement_mode` field is normative - a verifying party MUST reject a manifest whose `enforcement_mode` is `advisory` when the context requires `enforce`. This field aligns with cMCP's `enforcement_mode` attestation field.
 
 For `policy_language: composite`, the `hash` field MUST be a Merkle root over the hashes of each sub-bundle, sorted by policy language identifier in lexicographic order (`cedar`, `rego`, `yaml-agt`). Each sub-bundle MUST be hashed independently using the same hash algorithm as the manifest. The `agt_version` field MUST reference the AGT version used to assemble the composite bundle, even if individual sub-bundles were produced by other tools.
+
+<!-- CHANGED: #149 - pin the composite Merkle leaf encoding, which ADR-0003 defined for 3.2.3 and 3.2.5 but not here -->
+The composite tree is constructed per ADR-0003, and **`leaf_data` for it is the raw digest bytes of each sub-bundle hash**: the bytes the hash algorithm produces, not the `sha256:`-prefixed hex string and not a JSON descriptor. Each leaf is therefore `SHA-256(0x00 || <raw digest bytes>)`. This is normative rather than editorial: all three readings satisfy "a Merkle root over the hashes of each sub-bundle", they produce different roots from identical inputs, and a verifier holding a manifest cannot tell which one it is checking.
 
 AGT policy scope identifiers use the form `<namespace>:<resource-type>:<action>`, e.g., `finance:ledger:write`. For the full scope identifier registry, refer to the AGT specification.
 
@@ -1216,9 +1224,9 @@ The standard cryptographic profile uses the following primitives:
 
 ##### 4.1.1 Merkle Tree Domain Separation <!-- CHANGED: CRYPTO-005 - explicit domain separation per RFC 9162 to prevent length-extension attacks -->
 
-All Merkle tree constructions in this specification (corpus `merkle_root`, tool `catalog_hash`) MUST use the RFC 9162 / RFC 6962 domain-separated hashing convention:
+All Merkle tree constructions in this specification MUST use the RFC 9162 / RFC 6962 domain-separated hashing convention: <!-- CHANGED: #337 - the parenthetical named two of five constructions and went stale twice; the per-section definitions are now the single source -->
 
-- Leaf hash: `SHA-256(0x00 || leaf_data)` where `leaf_data` is the per-item input bytes as defined in the relevant section (section 3.2.3 for catalog, section 3.2.5.1 for corpus).
+- Leaf hash: `SHA-256(0x00 || leaf_data)`, where `leaf_data` is defined by the section specifying that construction.
 - Interior node hash: `SHA-256(0x01 || left_child_hash || right_child_hash)`.
 
 The `0x00` and `0x01` domain separation prefixes prevent second-preimage attacks that are possible with plain Merkle-Damgard SHA-256 trees lacking domain separation (as demonstrated in the Certificate Transparency literature). This construction is referenced in RFC 9162 Section 2.1.
