@@ -1,0 +1,48 @@
+name: Docs links
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "overrides/**"
+      - "mkdocs.yml"
+      - "requirements-docs.txt"
+      - "scripts/check_built_links.py"
+      - ".github/workflows/docs-links.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asset-paths:
+    name: Check built asset references
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Matches the install in docs.yml. Without the package, mkdocstrings
+      # cannot resolve API references and the build diverges from the deploy.
+      - name: Install docs dependencies
+        run: |
+          pip install --require-hashes -r requirements/docs.txt
+          pip install --require-hashes -r requirements/server.txt
+          pip install --no-deps -e python
+
+      # Deliberately not --strict. The deploy in docs.yml does not use it, so
+      # requiring it here would gate merges on pre-existing warnings this job
+      # was not added to fix. The check below inspects the built output.
+      - name: Build docs
+        run: mkdocs build -d site
+
+      # The deploy job in docs.yml only runs after merge, so without this a
+      # broken asset path is not visible until it is already published.
+      - name: Check that local asset references resolve
+        run: python scripts/check_built_links.py site

@@ -566,8 +566,25 @@ def _check_manifest_binding(
         )
         return warnings
 
-    artifacts = manifest.get("artifacts") or {}
-    policy_bundle = artifacts.get("policy_bundle") or {}
+    # `or {}` would fold falsy non-dicts ("", [], False, 0) into {} before the
+    # isinstance check ever saw them, so they were reported as merely
+    # "missing" instead of "malformed". Missing is only "absent key"
+    # or an explicit `None`; anything else that isn't a dict is a structural
+    # problem regardless of truthiness.
+    artifacts = manifest.get("artifacts")
+    if artifacts is None:
+        artifacts = {}
+    elif not isinstance(artifacts, dict):
+        warnings.append("manifest_artifacts_not_an_object")
+        return warnings
+
+    policy_bundle = artifacts.get("policy_bundle")
+    if policy_bundle is None:
+        policy_bundle = {}
+    elif not isinstance(policy_bundle, dict):
+        warnings.append("manifest_policy_bundle_not_an_object")
+        return warnings
+
     expected_policy_hash = policy_bundle.get("hash")
 
     if expected_policy_hash is None:

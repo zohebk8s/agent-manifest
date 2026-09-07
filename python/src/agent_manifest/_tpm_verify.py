@@ -50,7 +50,7 @@ from __future__ import annotations
 import hmac
 import struct
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime
 
 TPM_GENERATED_VALUE = 0xFF544347
 TPM_ST_ATTEST_NV = 0x8014
@@ -292,7 +292,9 @@ def parse_tpmt_signature(blob: bytes) -> ParsedSignature:
             return ParsedSignature(sig_alg, hash_alg, blob[offset - size:offset])
 
         if sig_alg == _ALG_ECDSA:
-            from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+            from cryptography.hazmat.primitives.asymmetric.utils import (
+                encode_dss_signature,
+            )
 
             parts: list[bytes] = []
             for _ in range(2):
@@ -319,35 +321,45 @@ def parse_tpmt_signature(blob: bytes) -> ParsedSignature:
     raise TpmVerificationError(f"unsupported signature algorithm 0x{sig_alg:04x}")
 
 
-def _verify_ak_chain(ak_chain_pem: bytes, trusted_roots_pem: bytes) -> "object":
+def _verify_ak_chain(
+    ak_chain_pem: bytes,
+    trusted_roots_pem: bytes,
+    *,
+    verification_time: datetime | None = None,
+) -> object:
     """Verify a leaf-first AK chain up to a pinned trusted root; return the leaf.
 
-    Raises :class:`TpmVerificationError` on any failure.
+    Delegates to :func:`._cert_chain.verify_cert_chain`, which is the same
+    appraisal the SEV-SNP and TDX paths use. Checking only "each certificate is
+    signed by the next, and the last one is pinned" is not enough: it accepts an
+    expired or not-yet-valid AK, a non-CA intermediate, and an intermediate whose
+    KeyUsage explicitly forbids certificate signing. Any of those is a chain a
+    relying party should never have treated as rooted in its pinned vendor CA.
+
+    Raises :class:`TpmVerificationError` on any failure, including malformed PEM.
+    The attestation dispatcher above only catches TpmVerificationError, so a raw
+    ValueError out of the certificate parser would escape it.
     """
     from cryptography import x509
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives.hashes import SHA256
 
-    chain = x509.load_pem_x509_certificates(ak_chain_pem)
-    roots = x509.load_pem_x509_certificates(trusted_roots_pem)
+    from ._cert_chain import CertChainError, verify_cert_chain
+
+    try:
+        chain = x509.load_pem_x509_certificates(ak_chain_pem)
+        roots = x509.load_pem_x509_certificates(trusted_roots_pem)
+    except (ValueError, TypeError) as exc:
+        raise TpmVerificationError(f"AK certificate material is malformed: {exc}") from exc
+
     if not chain:
         raise TpmVerificationError("empty AK certificate chain")
     if not roots:
         raise TpmVerificationError("no trusted TPM roots supplied")
 
-    for i in range(len(chain) - 1):
-        try:
-            chain[i].verify_directly_issued_by(chain[i + 1])
-        except (ValueError, TypeError, InvalidSignature) as exc:
-            raise TpmVerificationError(
-                f"AK chain certificate at position {i} is not validly issued by the next: {exc}"
-            ) from exc
+    try:
+        verify_cert_chain(chain, roots, verification_time=verification_time)
+    except CertChainError as exc:
+        raise TpmVerificationError(f"AK chain is not trusted: {exc}") from exc
 
-    trusted = {c.fingerprint(SHA256()) for c in roots}
-    if chain[-1].fingerprint(SHA256()) not in trusted:
-        raise TpmVerificationError(
-            "AK chain root is not among the supplied trusted TPM roots"
-        )
     return chain[0]
 
 
@@ -357,8 +369,9 @@ def verify_tpm_quote(
     ak_chain_pem: bytes,
     *,
     trusted_roots_pem: bytes,
-    expected_qualifying_data: Optional[bytes] = None,
-    expected_pcr_digest: Optional[bytes] = None,
+    expected_qualifying_data: bytes | None = None,
+    expected_pcr_digest: bytes | None = None,
+    verification_time: datetime | None = None,
 ) -> bool:
     """Fully verify a TPM 2.0 quote offline (all four steps, fail-closed).
 
@@ -373,6 +386,9 @@ def verify_tpm_quote(
         expected_qualifying_data: if given, the quote's ``extraData`` (nonce)
             must equal it.
         expected_pcr_digest: if given, the quote's PCR digest must equal it.
+        verification_time: UTC-aware time used to check AK chain certificate
+            validity periods (default: current UTC time). Primarily useful
+            for deterministic tests.
 
     Returns:
         ``True`` only when the structure, AK chain, AK signature, and any
@@ -403,7 +419,7 @@ def verify_tpm_quote(
         )
 
     # Step 2: AK certificate chain up to a pinned trusted root.
-    ak = _verify_ak_chain(ak_chain_pem, trusted_roots_pem)
+    ak = _verify_ak_chain(ak_chain_pem, trusted_roots_pem, verification_time=verification_time)
     ak_key = ak.public_key()  # type: ignore[attr-defined]
 
     # Step 3: AK signature over the TPMS_ATTEST blob. Use quote.raw rather than

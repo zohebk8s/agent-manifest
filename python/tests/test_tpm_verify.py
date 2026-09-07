@@ -12,7 +12,7 @@ import pytest
 
 crypto = pytest.importorskip("cryptography")
 
-from agent_manifest._tpm_verify import (  # noqa: E402
+from agent_manifest._tpm_verify import (    # noqa: E402
     TPM_GENERATED_VALUE,
     TPM_ST_ATTEST_NV,
     TPM_ST_ATTEST_QUOTE,
@@ -24,7 +24,6 @@ from agent_manifest._tpm_verify import (  # noqa: E402
     parse_tpmt_signature,
     verify_tpm_quote,
 )
-
 from cryptography import x509  # noqa: E402
 from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa  # noqa: E402
@@ -38,8 +37,30 @@ def _name(cn):
     return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
 
 
-def _cert(subject, subject_pub, issuer, issuer_key, halg=hashes.SHA256()):
+def _ca_extensions(builder):
+    """Mark a certificate as a CA that may sign certificates.
+
+    Real TPM vendor roots and intermediates carry both extensions. The AK chain
+    verifier now requires them on every issuing certificate, so a fixture that
+    omits them is not a weaker fixture, it is an unrealistic one.
+    """
     return (
+        builder
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False, content_commitment=False,
+                key_encipherment=False, data_encipherment=False,
+                key_agreement=False, key_cert_sign=True, crl_sign=True,
+                encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+    )
+
+
+def _cert(subject, subject_pub, issuer, issuer_key, halg=hashes.SHA256(), ca=False):
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_name(subject))
         .issuer_name(_name(issuer))
@@ -47,8 +68,10 @@ def _cert(subject, subject_pub, issuer, issuer_key, halg=hashes.SHA256()):
         .serial_number(x509.random_serial_number())
         .not_valid_before(_T0)
         .not_valid_after(_T0 + datetime.timedelta(days=3650))
-        .sign(issuer_key, halg)
     )
+    if ca:
+        builder = _ca_extensions(builder)
+    return builder.sign(issuer_key, halg)
 
 
 def _ak_chain(kind="ec"):
@@ -59,7 +82,7 @@ def _ak_chain(kind="ec"):
     else:
         root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         ak_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    root = _cert("test-tpm-root", root_key.public_key(), "test-tpm-root", root_key)
+    root = _cert("test-tpm-root", root_key.public_key(), "test-tpm-root", root_key, ca=True)
     ak = _cert("test-ak", ak_key.public_key(), "test-tpm-root", root_key)
     chain_pem = ak.public_bytes(Encoding.PEM) + root.public_bytes(Encoding.PEM)
     return ak_key, chain_pem, root.public_bytes(Encoding.PEM)
@@ -252,6 +275,65 @@ def test_nv_certify_parsers_are_public_api():
     assert agent_manifest.parse_tpm_nv_certify is parse_tpm_nv_certify
 
 
+def _ak_chain_at(not_before, not_after, kind="ec"):
+    """Like ``_ak_chain`` but with a caller-chosen validity window."""
+    def cert_at(subject, subject_pub, issuer, issuer_key, halg=hashes.SHA256(), ca=False):
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(_name(subject))
+            .issuer_name(_name(issuer))
+            .public_key(subject_pub)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+        )
+        if ca:
+            builder = _ca_extensions(builder)
+        return builder.sign(issuer_key, halg)
+
+    if kind == "ec":
+        root_key = ec.generate_private_key(ec.SECP256R1())
+        ak_key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ak_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = cert_at("test-tpm-root", root_key.public_key(), "test-tpm-root", root_key, ca=True)
+    ak = cert_at("test-ak", ak_key.public_key(), "test-tpm-root", root_key)
+    chain_pem = ak.public_bytes(Encoding.PEM) + root.public_bytes(Encoding.PEM)
+    return ak_key, chain_pem, root.public_bytes(Encoding.PEM)
+
+
+# ---------------------------------------------------------------------------
+# CERT-011: every certificate in the AK chain must be within its validity
+# period. verify_tpm_quote (via _verify_ak_chain) used to check signatures
+# only; an AK certificate or root whose validity window had already expired
+# still verified successfully.
+# ---------------------------------------------------------------------------
+
+
+def test_verify_rejects_expired_ak_chain():
+    ak_key, chain, roots = _ak_chain_at(
+        datetime.datetime(2010, 1, 1, tzinfo=datetime.timezone.utc),
+        datetime.datetime(2011, 1, 1, tzinfo=datetime.timezone.utc),  # expired a decade+ ago
+    )
+    attest = _build_attest(NONCE, PCR)
+    sig = _sign(ak_key, attest)
+    with pytest.raises(TpmVerificationError, match="outside its validity period"):
+        verify_tpm_quote(attest, sig, chain, trusted_roots_pem=roots)
+
+
+def test_verify_accepts_within_pinned_verification_time():
+    not_before = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+    not_after = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+    ak_key, chain, roots = _ak_chain_at(not_before, not_after)
+    attest = _build_attest(NONCE, PCR)
+    sig = _sign(ak_key, attest)
+    assert verify_tpm_quote(
+        attest, sig, chain, trusted_roots_pem=roots,
+        verification_time=datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc),
+    ) is True
+
+
 # ---------------------------------------------------------------------------
 # Full verification round-trip (EC and RSA AKs)
 # ---------------------------------------------------------------------------
@@ -339,7 +421,7 @@ def test_verify_rejects_untrusted_root():
     _, _, other_roots = _ak_chain()  # a different, unrelated root
     attest = _build_attest(NONCE, PCR)
     sig = _sign(ak_key, attest)
-    with pytest.raises(TpmVerificationError, match="trusted TPM roots"):
+    with pytest.raises(TpmVerificationError, match="does not match any trusted root"):
         verify_tpm_quote(attest, sig, chain, trusted_roots_pem=other_roots)
 
 
@@ -407,3 +489,75 @@ def test_attestation_chain_dispatches_tpm():
         expected_qualifying_data=NONCE,
     )
     assert result.signature is SignatureStatus.VERIFIED
+
+
+# ---------------------------------------------------------------------------
+# GHSA-mp83-94pc-7wqh: the AK chain helper checked only "signed by the next"
+# plus a pinned root fingerprint. It did not enforce certificate validity
+# periods, BasicConstraints(ca=True), or KeyUsage.key_cert_sign, all of which
+# the shared verify_cert_chain() already enforced for the SEV-SNP and TDX
+# paths. _verify_ak_chain now delegates to that same appraisal.
+# ---------------------------------------------------------------------------
+
+def _chain_with_issuer(*, ca: bool, key_cert_sign: bool):
+    """Build root -> AK where the root's CA / KeyUsage properties are chosen."""
+    root_key = ec.generate_private_key(ec.SECP256R1())
+    ak_key = ec.generate_private_key(ec.SECP256R1())
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(_name("test-tpm-root"))
+        .issuer_name(_name("test-tpm-root"))
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_T0)
+        .not_valid_after(_T0 + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False, content_commitment=False,
+                key_encipherment=False, data_encipherment=False,
+                key_agreement=False, key_cert_sign=key_cert_sign, crl_sign=False,
+                encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+    )
+    root = builder.sign(root_key, hashes.SHA256())
+    ak = _cert("test-ak", ak_key.public_key(), "test-tpm-root", root_key)
+    chain_pem = ak.public_bytes(Encoding.PEM) + root.public_bytes(Encoding.PEM)
+    return ak_key, chain_pem, root.public_bytes(Encoding.PEM)
+
+
+def test_verify_rejects_non_ca_issuer():
+    """A leaf masquerading as an issuer is not a CA, pinned or not."""
+    ak_key, chain, roots = _chain_with_issuer(ca=False, key_cert_sign=True)
+    attest = _build_attest(NONCE, PCR)
+    sig = _sign(ak_key, attest)
+
+    with pytest.raises(TpmVerificationError, match="is not a CA"):
+        verify_tpm_quote(attest, sig, chain, trusted_roots_pem=roots)
+
+
+def test_verify_rejects_issuer_that_may_not_sign_certificates():
+    """KeyUsage saying keyCertSign=False means the AK was never validly issued."""
+    ak_key, chain, roots = _chain_with_issuer(ca=True, key_cert_sign=False)
+    attest = _build_attest(NONCE, PCR)
+    sig = _sign(ak_key, attest)
+
+    with pytest.raises(TpmVerificationError, match="cannot sign certificates"):
+        verify_tpm_quote(attest, sig, chain, trusted_roots_pem=roots)
+
+
+def test_malformed_certificate_material_raises_tpm_error_not_value_error():
+    """The dispatcher above catches TpmVerificationError only.
+
+    A raw ValueError out of the PEM parser escaped it and surfaced as an
+    unhandled exception rather than a verification failure.
+    """
+    attest = _build_attest(NONCE, PCR)
+    _ak_key, _chain, roots = _ak_chain()
+    sig = _sign(_ak_key, attest)
+
+    with pytest.raises(TpmVerificationError, match="malformed"):
+        verify_tpm_quote(attest, sig, b"-----BEGIN CERTIFICATE-----\nnope\n", trusted_roots_pem=roots)

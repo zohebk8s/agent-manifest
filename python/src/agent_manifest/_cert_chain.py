@@ -19,8 +19,9 @@ each carrying their own chain verifier; the AMD-specific
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cryptography import x509
@@ -31,12 +32,44 @@ class CertChainError(Exception):
     """Raised when a certificate chain fails to verify or pin to a trusted root."""
 
 
-def verify_cert_chain(
-    chain: "Sequence[x509.Certificate]",
-    trusted_roots: "Sequence[x509.Certificate]",
+def check_validity_period(
+    cert: x509.Certificate,
     *,
-    root_fingerprint_hash: "Optional[HashAlgorithm]" = None,
-    verification_time: Optional[datetime] = None,
+    label: str,
+    verification_time: datetime | None = None,
+) -> None:
+    """Raise :class:`CertChainError` if *cert* is expired or not yet valid.
+
+    Every certificate-chain verifier in this package (SEV-SNP, TDX, TPM, and
+    this module's own :func:`verify_cert_chain`) needs the same check, so it
+    lives here once rather than as three copies that can silently drift out
+    of sync with each other.
+
+    Args:
+        cert: the certificate to check.
+        label: identifies which certificate this is in the caller's chain
+            (e.g. ``"VCEK"``, ``"PCK chain link 0"``), for the error message.
+        verification_time: UTC-aware time to check against (default: current
+            UTC time). Primarily useful for deterministic tests.
+    """
+    now = verification_time or datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise CertChainError("verification_time must be timezone-aware")
+    now = now.astimezone(timezone.utc)
+    if not (cert.not_valid_before_utc <= now < cert.not_valid_after_utc):
+        raise CertChainError(
+            f"{label} is outside its validity period "
+            f"({cert.not_valid_before_utc.isoformat()} - "
+            f"{cert.not_valid_after_utc.isoformat()}, checked at {now.isoformat()})"
+        )
+
+
+def verify_cert_chain(
+    chain: Sequence[x509.Certificate],
+    trusted_roots: Sequence[x509.Certificate],
+    *,
+    root_fingerprint_hash: HashAlgorithm | None = None,
+    verification_time: datetime | None = None,
 ) -> bool:
     """Verify a leaf-first certificate chain up to a fingerprint-pinned root.
 
@@ -61,11 +94,13 @@ def verify_cert_chain(
         CertChainError: on an empty chain, no trusted roots, a link that is not
             validly issued by the next, an expired or not-yet-valid certificate,
             an issuer that is not a CA, an issuer whose key usage forbids
-            certificate signing, an unpinned root, or missing ``cryptography``.
+            certificate signing, an issuer whose ``pathLenConstraint`` is
+            violated by the CA certificates below it, an unpinned root, or
+            missing ``cryptography``.
     """
     try:
-        from cryptography.exceptions import InvalidSignature
         from cryptography import x509
+        from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives.hashes import SHA256
     except ImportError as e:  # pragma: no cover - exercised via install extra
         raise CertChainError(
@@ -83,8 +118,7 @@ def verify_cert_chain(
     now = now.astimezone(timezone.utc)
 
     for i, cert in enumerate(chain):
-        if not (cert.not_valid_before_utc <= now < cert.not_valid_after_utc):
-            raise CertChainError(f"certificate at position {i} is outside its validity period")
+        check_validity_period(cert, label=f"certificate at position {i}", verification_time=now)
 
     for i, issuer in enumerate(chain[1:], start=1):
         try:
@@ -97,6 +131,23 @@ def verify_cert_chain(
             ) from exc
         if not constraints.ca:
             raise CertChainError(f"issuer certificate at position {i} is not a CA")
+        # RFC 5280 4.2.1.9: pathLenConstraint bounds how many CA certificates
+        # may follow this one on the way to the leaf. Position 0 is the leaf
+        # itself, so positions 1..i-1 are the CA certificates between this
+        # issuer and the leaf - `i - 1` of them.
+        #
+        # Simplification: RFC 5280 excludes self-issued certificates (subject
+        # == issuer, used for CA key rollover) from this count. None of the
+        # three attestation call sites in this codebase (SEV-SNP, TDX, TPM)
+        # ever produce a self-issued intermediate, and treating every CA as
+        # counting is the fail-closed direction - it can only reject a chain
+        # the full RFC algorithm would accept, never the reverse.
+        if constraints.path_length is not None and (i - 1) > constraints.path_length:
+            raise CertChainError(
+                f"issuer certificate at position {i} has path_length="
+                f"{constraints.path_length}, but {i - 1} CA certificate(s) "
+                "follow it toward the leaf"
+            )
         try:
             key_usage = issuer.extensions.get_extension_for_class(x509.KeyUsage).value
         except x509.ExtensionNotFound:
